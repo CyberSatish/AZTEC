@@ -1,0 +1,503 @@
+{
+ "cells": [
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Import of the libraries"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": 1,
+   "metadata": {},
+   "outputs": [
+    {
+     "name": "stderr",
+     "output_type": "stream",
+     "text": [
+      "Using TensorFlow backend.\n"
+     ]
+    }
+   ],
+   "source": [
+    "import numpy as np\n",
+    "from keras.models import Sequential, Model\n",
+    "from keras import layers, Input\n",
+    "from keras.optimizers import Adam\n",
+    "from keras import backend as K\n",
+    "import tensorflow as tf\n",
+    "import pybobyqa\n",
+    "import scipy.optimize"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# (I) Long-term dedicated capacity forecasting"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Function to perform the forecasting"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def forecast(model, data, min_index, max_index, T_l,\n",
+    "                     lookback, num_services, num_iters):\n",
+    "    load_forecasted = np.zeros((int(\n",
+    "        np.ceil((max_index - (min_index + lookback))/T_l)),\n",
+    "                                num_services, num_iters))\n",
+    "    for idx, i in enumerate(range(min_index+lookback, max_index, T_l)):\n",
+    "        block = data[i-lookback:i].reshape((1, lookback, data.shape[1],\n",
+    "                                            data.shape[2], num_services))\n",
+    "        for sample in range(num_iters):\n",
+    "            load_forecasted[idx, :, sample] = model.predict(block)\n",
+    "    return load_forecasted"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Loss function"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def cost_block_1(k_o, k_r, T_l):\n",
+    "    def cost_func_slopes(y_true, y_pred):\n",
+    "        y_pred = tf.expand_dims(y_pred, axis=1)\n",
+    "        y_pred = tf.tile(y_pred, (1, T_l, 1))\n",
+    "        diff = y_pred - y_true\n",
+    "        cost = np.zeros(diff.shape)\n",
+    "        pos_penalty = k_o * diff\n",
+    "        neg_penalty = k_r * diff\n",
+    "        cost = tf.where(diff > 0, pos_penalty, cost)\n",
+    "        cost = tf.where(diff <= 0, neg_penalty, cost)\n",
+    "        cost = tf.abs(cost)\n",
+    "        cost = K.sum(K.sum(cost, axis=-1), axis=-1)\n",
+    "        return cost\n",
+    "    return cost_func_slopes"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Build NN model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def make_block_1_model(load_input_shape, lookback, num_services, k_o, k_r, T_l):\n",
+    "    '''Build block 1 NN model'''\n",
+    "    inputs = Input((lookback, load_input_shape[1], load_input_shape[2],\n",
+    "                    num_services))\n",
+    "    model = layers.Conv3D(32, (3, 3, 3), activation='relu',\n",
+    "                          padding='same')(inputs)\n",
+    "    model = layers.Conv3D(32, (6, 6, 6), activation='relu',\n",
+    "                          padding='same')(model)\n",
+    "    model = layers.Dropout(0.3)(model, training=True) # adding training=True the Dropout layer will work also with predict\n",
+    "    model = layers.Conv3D(16, (6, 6, 6), activation='relu',\n",
+    "                          padding='same')(model)\n",
+    "    model = layers.Dropout(0.3)(model, training=True)\n",
+    "    model = layers.Flatten()(model)\n",
+    "    model = layers.Dense(64, activation='relu')(model)\n",
+    "    model = layers.Dense(32, activation='relu')(model)\n",
+    "    output = layers.Dense(num_services, activation='relu')(model)\n",
+    "    model = Model(inputs, output)\n",
+    "    model.compile(optimizer=Adam(0.0005), loss=cost_block_1(k_o, k_r, T_l))\n",
+    "    return model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Create, training and forecast Block (I)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "N = 6\n",
+    "batch_size = 128\n",
+    "num_iters # number of time you repeat the same prediction to measure NN uncertainty\n",
+    "load_input # numpy matrix of shape(len(dataset), nº row, nº col, num_services). \n",
+    "load_output # numpy matrix of shape (len(dataset), 1, num_services).\n",
+    "model = make_block_1_model(load_input.shape, N, num_services, k_o, k_r, T_l)\n",
+    "history = model.fit_generator(train_gen, steps_per_epoch=150, epochs=100, validation_data=val_gen, validation_steps=40, verbose=0)\n",
+    "load_predicted = forecast(model, load_input, min_index=start_index_test_dataset, max_index=end_index_test_dataset, delay=T_l, lookback=N, num_services=num_services, num_iters=num_iters)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# (II) Long-term total shared capacity forecasting"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Function to perform the forecasting"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def forecast_cluster(model, data, min_index, max_index, T_l, lookback, num_iters):\n",
+    "    load_forecasted = np.zeros((int(np.ceil((max_index - (min_index + lookback))/T_l)), 1, num_iters))\n",
+    "    for idx, i in enumerate(range(min_index+lookback, max_index, T_l)):\n",
+    "        block = data[i-lookback:i].reshape((1, lookback))\n",
+    "        for sample in range(num_iters):\n",
+    "            load_forecasted[idx, :, sample] = model.predict(block)\n",
+    "    return load_forecasted"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Loss function"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def cost_block_2(k_s, k_o, T_l):\n",
+    "    def cost_func(y_true, y_pred):\n",
+    "        epsilon = 0.1\n",
+    "        y_pred = tf.expand_dims(y_pred, axis=1)\n",
+    "        y_pred = tf.tile(y_pred, (1, T_l, 1))\n",
+    "        diff = y_pred - y_true\n",
+    "        cost = np.zeros(diff.shape)\n",
+    "        y1 = -epsilon * diff + k_s\n",
+    "        y2 = -np.true_divide(1, epsilon) * diff + k_s\n",
+    "        y3 = k_o * diff - epsilon*k_s*k_o\n",
+    "        cost = tf.where(diff < 0, y1, cost)\n",
+    "        cost = tf.where(tf.logical_and((diff <= epsilon*k_s), (diff >= 0)), y2, cost)\n",
+    "        cost = tf.where(diff > epsilon*k_s, y3, cost)\n",
+    "        cost = tf.abs(cost)\n",
+    "        cost = K.sum(K.sum(cost, axis=-1), axis=-1)\n",
+    "        return cost\n",
+    "    return cost_func"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Build NN model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def make_block_2_model(lookback, k_s, k_o, T_l):\n",
+    "    inputs = Input((lookback,1))\n",
+    "    model = layers.Dense(128, activation='relu')(inputs)\n",
+    "    model = layers.Dropout(0.2)(model, training=True)\n",
+    "    model = layers.Dense(64, activation='relu')(model)\n",
+    "    output = layers.Dense(1, activation='relu')(model)\n",
+    "    model = Model(inputs, output)\n",
+    "    model.compile(optimizer=Adam(0.0005),\n",
+    "                  loss=cost_block_2(k_s, k_o, T_l))\n",
+    "    return model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Create, training and forecast Block (II)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "N = 6\n",
+    "batch_size = 128\n",
+    "num_iters # number of time you repeat the same prediction to measure NN uncertainty\n",
+    "load_input # numpy matrix of shape(len(dataset), 1). \n",
+    "load_output # numpy matrix of shape (len(dataset), 1).\n",
+    "model_2 = make_block_2_model(N, k_s, k_o, T_l)\n",
+    "history = model_2.fit_generator(train_gen, steps_per_epoch=150, epochs=100, validation_data=val_gen, validation_steps=40, verbose=0)\n",
+    "load_predicted = forecast_block_2(model_2, load_input, min_index=start_index_test_dataset, max_index=end_index_test_dataset, T_l=T_l, lookback=N, num_iters=num_iters)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# (Helper) Short-term demand prediction"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Function to perform the forecasting"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def forecast_batch(model, data, min_index, max_index, lookback, num_services, num_iters):\n",
+    "    load_forecasted = np.zeros((max_index - (min_index + lookback), num_services, num_iters))\n",
+    "    rows = np.arange(min_index+lookback, max_index)\n",
+    "    samples = np.zeros((len(rows), lookback, data.shape[1], data.shape[2], num_services))\n",
+    "    for j, row in enumerate(rows):\n",
+    "        indices = np.arange(row - lookback, row)\n",
+    "        samples[j] = data[indices]\n",
+    "    for sample in range(num_iters):\n",
+    "        load_forecasted[:, :, sample] = model.predict(samples)\n",
+    "    return load_forecasted"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Build NN model"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def make_helper_model(input_shape, lookback, num_services):\n",
+    "    inputs = Input((lookback, input_shape[1], input_shape[2],\n",
+    "                    num_services))\n",
+    "    model = layers.Conv3D(32, (3, 3, 3), activation='relu',\n",
+    "                          padding='same')(inputs)\n",
+    "    model = layers.Conv3D(32, (6, 6, 6), activation='relu',\n",
+    "                          padding='same')(model)\n",
+    "    model = layers.Dropout(0.5)(model, training=True)\n",
+    "    model = layers.Conv3D(16, (6, 6, 6), activation='relu',\n",
+    "                          padding='same')(model)\n",
+    "    model = layers.Dropout(0.5)(model, training=True)\n",
+    "    model = layers.Flatten()(model)\n",
+    "    model = layers.Dense(64, activation='relu')(model)\n",
+    "    model = layers.Dropout(0.3)(model, training=True)\n",
+    "    model = layers.Dense(32, activation='relu')(model)\n",
+    "    output = layers.Dense(num_services, activation='relu')(model)\n",
+    "    model = Model(inputs, output)\n",
+    "    model.compile(optimizer=Adam(0.0005), loss='MAE')\n",
+    "    return model"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Create, training and forecast Block (Helper)"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "N = 6\n",
+    "batch_size = 128\n",
+    "num_iters # number of time you repeat the same prediction to measure NN uncertainty\n",
+    "load_input # numpy matrix of shape(len(dataset), nº row, nº col, num_services). \n",
+    "load_output # numpy matrix of shape (len(dataset), 1, num_services).\n",
+    "model_helper = make_helper_model(load_input.shape, N, num_services)\n",
+    "history = model_helper.fit_generator(train_gen, steps_per_epoch=150, epochs=100, validation_data=val_gen, validation_steps=40, verbose=0)\n",
+    "load_predicted = forecast_batch(model_helper, load_input, min_index=start_index_test_dataset, max_index=end_index_test_dataset, lookback=N, num_services=num_services, num_iters=num_iters)"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "# (III) Short-term shared capacity allocation"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def return_cplus_fix_ps(p_vector, total_shared, p_s):\n",
+    "    \"\"\" Return c_plus given p and max amount of shared for\n",
+    "    that k_o,k_s and time. \"\"\"\n",
+    "    cplus = np.zeros(p_vector.shape)\n",
+    "    products = np.zeros(p_vector.shape[0])\n",
+    "    for i in range(len(cplus)):\n",
+    "        products[i] = np.true_divide(np.prod(p_vector[i:]),\n",
+    "                                     np.prod((1-p_vector)[i:]))\n",
+    "    cplus_s = np.true_divide(total_shared * p_s,\n",
+    "                            np.sum(products) + 1)\n",
+    "    for i in range(len(cplus)):\n",
+    "        cplus[i] = products[i] * cplus_s\n",
+    "    return cplus, cplus_s"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def cost_func_evaluation_p_fix_ps(p, lambda_i, dedicated, total_shared, p_s, k_o, k_s):\n",
+    "    ''' Evaluate the cost of the allocation given cplus selected.'''\n",
+    "    total_cost = 0\n",
+    "    cplus, cplus_s = return_cplus_fix_ps(p, total_shared, ps)\n",
+    "    for i in range(lambda_i.shape[0]):  # shape[0] = num services\n",
+    "        total_cost += cplus[i] * k_o\n",
+    "        ecdf = ECDF(lambda_i[i])\n",
+    "        total_cost += (1-ecdf(dedicated[i] + cplus[i])) * k_s\n",
+    "    return total_cost"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def return_cplus(p_vector, total_shared):\n",
+    "    \"\"\" Return c_plus given p and max amount of shared for\n",
+    "    that phi,alpha and time. \"\"\"\n",
+    "    cplus = np.zeros(p_vector.shape)\n",
+    "    products = np.zeros(p_vector.shape[0]-1)\n",
+    "    for i in range(len(cplus)-1):\n",
+    "        products[i] = np.true_divide(np.prod(p_vector[i:-1]),\n",
+    "                                     np.prod((1-p_vector)[i:-1]))\n",
+    "    cplus[-1] = np.true_divide(total_shared * p_vector[-1],\n",
+    "                               np.sum(products) + 1)\n",
+    "    for i in range(len(cplus)-1):\n",
+    "        cplus[i] = products[i] * cplus[-1]\n",
+    "    return cplus"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def cost_func_evaluation_p(p, lambda_i, dedicated, total_shared, k_o, k_s):\n",
+    "    ''' Evaluate the cost of the allocation given cplus selected.'''\n",
+    "    total_cost = 0\n",
+    "    cplus = return_cplus(p, total_shared)\n",
+    "    for i in range(lambda_i.shape[0]):  # shape[0] = num services\n",
+    "        total_cost += k_o * cplus[i]\n",
+    "        ecdf = ECDF(forecasting[i])\n",
+    "        total_cost += (1-ecdf(static[i] + cplus[i])) * k_s\n",
+    "    return total_cost"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "def fun(p_s, lambda_i, dedicated, total_shared, k_o, k_s, num_services, lower_bound, upper_bound):\n",
+    "    \"\"\" Function with only one variable to be minimized through\n",
+    "        bounded golden search\n",
+    "    \"\"\"\n",
+    "    p_0 = np.ones(num_services) * 0.5\n",
+    "    opt = pybobyqa.solve(cost_func_evaluation_p_fix_ps, p_0,\n",
+    "                         bounds=(lower_bound[:num_services], upper_bound[:num_services]),\n",
+    "                         args=(lambda_i, dedicated, total_shared, p_s, k_o, k_s))\n",
+    "    return opt.f"
+   ]
+  },
+  {
+   "cell_type": "markdown",
+   "metadata": {},
+   "source": [
+    "## Main"
+   ]
+  },
+  {
+   "cell_type": "code",
+   "execution_count": null,
+   "metadata": {},
+   "outputs": [],
+   "source": [
+    "lower_bound = np.ones(num_services) * 1e-10\n",
+    "upper_bound = np.ones(num_services) * 0.99999\n",
+    "# Repeat for each time slot T_s\n",
+    "p0_s = scipy.optimize.minimize_scalar(fun, bounds(1e-10, 0.99999), method='bounded', args=(lambda_i, x_d, x_s, k_o, k_s, num_services, lower_bound, upper_bound))\n",
+    "p0_s = p0_s.x\n",
+    "p0 = np.ones(num_services-1) * 0.5\n",
+    "test = pybobyqa.solve(cost_func_evaluation_p_fix_ps, p0, bounds=(lower_bound[:num_services-1], upper_bound[:num_services-1]),\n",
+    "                      args=(lambda_i, x_d, x_s, p0_s, k_o, k_s))\n",
+    "p0 = np.zeros(num_services)\n",
+    "p0[:num_services-1] = test.x\n",
+    "p0[-1] = p0_s\n",
+    "p = pybobyqa.solve(cost_func_evaluation_p, p0, bounds=(lower_bound[:num_services], upper_bound[:num_services]),\n",
+    "                   args=(lambda_i, x_d, x_s, k_o, k_s))\n",
+    "cplus = return_cplus(p.x, x_s)\n",
+    "p = p.x"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.5.6"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 2
+}
